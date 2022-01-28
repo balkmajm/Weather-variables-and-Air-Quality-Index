@@ -1,0 +1,662 @@
+---
+title: "Final Project"
+author: "Jared Balkman"
+date: "12/11/2021"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+FINAL PROJECT: PREDICTING AIR QUALITY FROM WEATHER DATA
+
+```{r, echo=FALSE}
+
+library(dplyr)  #piping
+library(tidytable)  #expand(), right_join()
+library(lubridate) #date/time conversion to numeric
+library(corrplot); library(RColorBrewer)  #correlation plot to examine collinearity
+library(car)  #VIF()
+
+#needed?
+#library(imputeTS) 
+library(tidyr)  #fill() function
+library(purrr)  #map() for bulk Shapiro test
+library(psych)  #multi.hist()) for multiple histograms
+library(EnvStats)  #boxcox(), boxcoxTransform()
+library(caret)  #CV, PCR/PLS
+library(MASS)  #rlm()
+library(ggplot2)
+library(pls) #pcr
+library(leaps)  #regsubsets()
+
+```
+
+Read in the data:
+
+```{r}
+
+#n=2502
+air <- read.csv("Shanghai AQI and Wheather 2014-2021.csv")
+
+#n=2587
+air2 <- read.csv("shanghai.csv")
+
+#Note: 'air' has two variables not found in 'air2' - AQI and AQI_Explained, which are our response variable candidates. 'air2' has five variables - moon rise/set and sun rise/set time of day, and location.
+
+```
+
+Clean data:
+
+```{r}
+
+#1/1/2014 - 1/30/2021 = 2587 days. air2 has 2587 rows, but we still should check for duplicates, which we could do by looking at the date:
+
+air2[duplicated(air2$date_time), ]
+
+#No duplicates. Confirmation that all dates are accounted for can be done via brute forcevisual inspection. Next, account for discrepancy between number of days between first and last dates vs number of rows in 'air. To do this, first convert air2$date_time and air$date to numeric via conversion to date (default origin date in R is 1970-01-01):
+
+air <- air %>%
+  mutate(date = as.Date(date)) %>%
+  mutate(date = as.numeric(date))
+
+air2 <- air2 %>%
+  mutate(date_time = as.Date(date_time)) %>%
+  mutate(date_time = as.numeric(date_time))
+
+#Find the rows missing from 'air':
+missing_rows <- subset(air2, !(air2$date_time %in% air$date))
+
+#There are 85 rows/days missing from 'air'. We will impute, but first merge the two df's so we have all variables in one df. This can be done with functions from the tidytable package:
+
+air_all = expand.(right_join.(air, air2))
+
+#Now remove unnecessary variables. Location is "shanghai" for all values and is useless. We can also drop 'date' in favor of 'date_time', which has all the values for rows missing from 'air'. 'totalSnow_c,m' is likewise useless with only 14 nonzero values out of 2587 obs
+
+air_all <- air_all %>%
+  dplyr::select(-location, -date, -totalSnow_cm)
+
+#The following is chr variable which should be a factor if we want to use it:
+
+#AQI_Explained
+
+air_all <- air_all %>%
+  mutate(AQI_Explained = factor(AQI_Explained))
+
+#The following are chr variables which we need to be numeric:
+
+#moonrise
+#moonset
+#sunrise
+#sunset
+
+#We can do this by converting 'chr' -> 'difftime' -> 'numeric' using the lubridate package:
+
+air_all <- air_all %>%
+  mutate(moonrise = difftime(as.POSIXct(moonrise, format = '%H:%M'),
+           as.POSIXct('00:00', format = '%H:%M'), units = 'min')) %>%
+  mutate(moonset = difftime(as.POSIXct(moonset, format = '%H:%M'),
+           as.POSIXct('00:00', format = '%H:%M'), units = 'min')) %>%
+  mutate(sunrise = difftime(as.POSIXct(sunrise, format = '%H:%M'),
+           as.POSIXct('00:00', format = '%H:%M'), units = 'min')) %>%
+  mutate(sunset = difftime(as.POSIXct(sunset, format = '%H:%M'),
+           as.POSIXct('00:00', format = '%H:%M'), units = 'min')) %>%
+  mutate_if(is.difftime, as.numeric)
+
+#This gives us minutes since 12:00 AM, including for the PM values. But, since we will be standardizing, shift by constant shouldn't matter w.r.t. our model.
+
+#This seems like a good place to save our df:
+
+write.csv(air_all, "air_all.csv")
+
+#Now we'll impute:
+
+names(which(colSums(is.na(air_all)) > 0))
+
+#AQI
+#AQI_Explained
+#moonrise
+#moonset
+
+#We assume values are missing at random. For simplicity's sake, we impute all missing values using Last One Carried Forward. The argument using dplyr is 'down'.
+
+air_all <- air_all %>%
+  fill(AQI_Explained, .direction = 'down') %>%
+  fill(AQI, .direction = 'down') %>%
+  fill(moonrise, .direction = 'down') %>%
+  fill(moonset, .direction = 'down')
+
+any(is.na(air_all))
+
+#Save this as our clean data:
+
+write.csv(air_all, "air_all_clean.csv")
+
+
+
+
+```
+
+Explore data:
+
+```{r}
+
+#put response variables in separate dataframes
+y <- air_all$AQI
+# y_cat <- air_all$AQI_Explained
+
+air_all <- air_all %>%
+  dplyr::select(-AQI, -AQI_Explained)
+
+#First examine normality of variables, using hist() and shapiro.test()
+
+#example of non-normal looking hist
+shapiros <- hist(air_all$windspeedKmph)
+
+#make a list of each variable/shapiro p-value
+normal_vars <- map(air_all, shapiro.test) %>%
+  keep(~ .x$p.value > 0.05)
+
+#Every variable is non-normal at p = 0.05!
+#Transform based on visual appearance
+
+#RIGHT SKEWED:
+#WindGustKmph
+#precipMM
+
+#LEFT SKEWED
+#DewPointC
+#WindChillC
+#humidity
+
+#log transforms for right-skewed
+#used log(p+1) for precipMM to avoid -Inf values
+air_all <- air_all %>%
+  mutate(log_WindGustKmph = log(WindGustKmph)) %>%
+  mutate(log_precipMM = log(precipMM + 1)) %>%
+  dplyr::select(-WindGustKmph, -precipMM)
+
+
+#NOTE: BoxCox transformations automated with preProc in train()
+
+# #boxcox transformation for left-skewed. First we need to adjust both DewPointC and WindChillC to make all values positive:
+# 
+# min(air_all$DewPointC)
+# #-23
+# min(air_all$WindChillC)
+# #-14
+# #min(air_all$humidity) > 0 so no shift needed
+# 
+# #find optimal lambda
+# box_DewPointC <- EnvStats::boxcox(air_all$DewPointC + 24, optimize = T, objective.name = "Shapiro-Wilk")$lambda
+# box_WindChillC <- EnvStats::boxcox(air_all$WindChillC + 54, optimize = T, objective.name = "Shapiro-Wilk")$lambda
+# box_humidity <- EnvStats::boxcox(air_all$humidity, optimize = T, objective.name = "Shapiro-Wilk")$lambda
+# 
+# #apply transformation with the lambdas
+# trans_DewPointC = boxcoxTransform(air_all$DewPointC + 24, box_DewPointC)
+# trans_WindChillC = boxcoxTransform(air_all$WindChillC + 15, box_WindChillC)
+# trans_humidity = boxcoxTransform(air_all$humidity, box_humidity)
+# 
+# #replace variables with transformations
+# air_all <- air_all %>%
+#   mutate(boxcox_DewPointC = trans_DewPointC + 1) %>%
+#   mutate(boxcox_WindChillC = trans_WindChillC + 1) %>%
+#   mutate(boxcox_humidity = trans_humidity) %>%
+#   dplyr::select(-DewPointC, -WindChillC, -humidity)
+
+#initial linear model done before any transformation or removal of variables gave no significant coefficients. Now:
+lin = lm(y ~ ., air_all)
+summary(lin)
+
+
+#Many variables are significant, but we still likely have some multicollinearity. So let's examine this using a plot and VIF, after getting rid of non-numeric columns:
+
+
+pairs(air_all[,1:5])
+
+air_num <- select_if(air_all, is.numeric)
+
+# Compute correlation matrix
+correlations <- cor(air_all, use = "pairwise.complete.obs")
+
+# Make the correlation plot
+corrplot::corrplot(correlations,
+         type = "upper",
+         order = "hclust",
+         col = rev(brewer.pal(n = 8, name = "RdYlBu")))
+
+#Many highly correlated variables, perhaps perfectly so, so we expect an error when running vif()
+#vif(lin)
+
+#Error in vif.default(lin) : there are aliased coefficients in the model
+
+alias(lin)
+
+plot(air_all$maxtempC, air_all$mintempC)
+plot(air_all$cloudcover, air_all$visibility)
+
+lin2 <- lm(y ~ . -maxtempC, air_all)
+vif(lin2)
+
+#12 variables with VIF > 10. Lots of collinearity here motivating principal components analysis
+
+```
+
+PCA - manual
+
+```{r}
+
+#Check for Inf, -Inf values
+sapply(air_all, function(x) all(is.finite(x)))
+
+#prcomp
+pc.info = prcomp(air_all2, center=T, scale=T)
+                 
+summary(pc.info) # min(n-1,p) is number of components explaining variance (proportion of variance  > 0)
+
+plot(pc.info)
+
+# cumulative PVE directly from output
+CumulativePVE <- summary(pc.info)$importance[3,]; CumulativePVE
+
+plot(CumulativePVE, type = "o", ylab="Cumulative PVE", xlab="Principal Component", main = "90% PVE with 8 Components")
+abline(v=8, col = 'red', lwd = 2)
+
+
+#PC components and visuals
+# loadings of principal components
+pc.info$rotation  
+pc.loadings1 = pc.info$rotation[,1]  # loadings for first principal component
+pc.loadings2 = pc.info$rotation[,2]  # loadings for second principal component
+pc1scores = pc.info$x[,1]  # first principal component score vector
+pc2scores = pc.info$x[,2]  # second principal component score vector
+
+# plotting score vectors + loadings of first two principal components
+biplot(pc.info,choices=1:2,scale=0, main = 'PC2 ("Moisture") vs. PC1 ("Temperature")', ylab = 'PC2 (13.47%)', xlab = 'PC1 (42.77%)')
+
+#most important variables based on abs(loading)
+head(sort(abs(pc.loadings1), decreasing = T),10)
+head(sort(abs(pc.loadings2), decreasing = T))
+
+Loadings <- as.data.frame(pc.info$rotation)
+
+#> 90% of the variation explained by first 8 PCs
+```
+
+PCR
+```{r}
+
+set.seed(1)
+
+#initial fit
+ctrl = trainControl(method = "cv", number = 10)
+fit_pcr = train(y = y,
+                x = air_all,
+                method = "pcr",
+                tuneGrid = expand.grid(ncomp = 1:23),
+                preProc = c("center","scale","BoxCox"),
+                trControl = ctrl)
+
+fit_pcr
+
+#ncomp = 17
+
+#minimum RMSE
+pcr_RMSE = fit_pcr$results[17,]
+
+```
+
+
+PLS
+
+```{r}
+set.seed(1)
+
+#initial PLS fit
+ctrl = trainControl(method = "cv", number = 10)
+fit_pls = train(y = y,
+                x = air_all,
+                method = "pls",
+                tuneGrid = expand.grid(ncomp = 1:23),
+                preProc = c("center","scale","BoxCox"),
+                trControl = ctrl)
+
+fit_pls
+
+#ncomp = 13
+
+#minimum RMSE
+pls_RMSE = fit_pls$results[13,]
+
+```
+
+Robust Regression
+```{r}
+
+#Initially errors coming from multicollinearity/aliased variables
+#removed -maxtempC
+
+air_all2 = air_all %>%
+  dplyr::select(-maxtempC)
+
+set.seed(1)
+
+#try with all predictors and best subset
+best_subset <- regsubsets(y ~ ., data = air_all2, nvmax = 23)
+
+plot(best_subset, scale = "adjr2")
+
+#plot of R^2 as function of number of vars
+best_subset_summary = summary(best_subset)
+best_subset_summary$adjr2
+
+plot(best_subset_summary$adjr2, xlab = "Number of Variables",
+                         ylab = "Adjusted R^2",
+                         type = "l",
+                         lwd = 2)
+
+#nvars for maximum R2
+which.max(best_subset_summary$adjr2)
+#15
+
+#Which variables are they?
+best_subset_df <- as.data.frame(best_subset_summary$outmat)
+#which variables to use
+
+best_subset_df[14, which(best_subset_df[15,] == "*")]
+
+# mintempC
+# uvIndex
+# FeelsLikeC
+# WindChillC
+# cloudcover
+# humidity
+# pressure
+# tempC
+# visibility
+# winddirDegree
+# windspeedKmph
+# date_time
+# sunrise
+# sunset
+# log_precipMM
+
+air_all_sub <- air_all2 %>%
+  dplyr::select(mintempC,
+uvIndex,
+FeelsLikeC,
+WindChillC,
+cloudcover,
+humidity,
+pressure,
+tempC,
+visibility,
+winddirDegree,
+windspeedKmph,
+date_time,
+sunrise,
+sunset,
+log_precipMM)
+
+set.seed(1)
+
+#initial RR fit
+ctrl = trainControl(method = "cv", number = 10)
+fit_robust = train(y = y,
+                x = air_all2,
+                method = "rlm",
+                tuneGrid = NULL,
+                preProc = c("center","scale", "BoxCox"),
+                trControl = ctrl)
+
+#initial RR fit using just PC1 and PC2 as predictors
+fit_robust_2 = train(AQI ~ x1 + x2,
+                     data = air_final_2,
+                     method = "rlm",
+                     tuneGrid = NULL,
+                     preProc = c("center","scale", "BoxCox"),
+                trControl = ctrl))
+
+summary(fit_robust)
+summary(fit_robust_2)
+
+robust_RMSE = fit_robust$results[5,]
+robust_2_RMSE = fit_robust_2$results[5,]
+
+
+#important variables for all models
+imp_var = varImp(fit_robust)
+imp_var2 = varImp(fit_robust_2)
+imp_var3 = varImp(fit_pcr)
+imp_var4 = varImp(fit_pls)
+
+plot(imp_var)
+plot(imp_var2)
+plot(imp_var3, main = "PCR Variable Importance")
+plot(imp_var4, main = "PLS Variable Importance")
+
+```
+
+Comparison of errors
+
+```{r}
+
+#make a dataframe of min measurements
+results = rbind(pcr_RMSE[2:7], pls_RMSE[2:7], robust_RMSE[3:8], robust_2_RMSE[3:8])
+
+rownames(results) <- c("pcr", "pls", "psi.hampel", "psi.hampel PCs")
+
+results
+
+#validation plots for PC models (not used)
+validationplot(fit_pcr$finalModel, main = "PCR")
+validationplot(fit_pls$finalModel, main = "PLS")
+
+
+```
+
+Model Assessment
+```{r}
+#setup, define n and put y back in with predictors
+
+air_final <- air_all2 %>%
+  mutate(AQI = y)
+
+n = dim(air_final)[1]
+
+##### model assessment OUTER shell #####
+# produce loops for 10-fold cross-validation for model ASSESSMENT
+nfolds = 10
+groups = rep(1:nfolds,length=n)  #produces list of group labels
+set.seed(1)
+cvgroups = sample(groups,n)  #orders randomly
+
+# set up storage for predicted values from the double-cross-validation
+allpredictedCV = rep(NA,n)
+# set up storage to see what models are "best" on the inner loops
+allbestTypes = rep(NA,nfolds)
+allbestPars = vector("list",nfolds)
+
+# loop through outer splits
+for (j in 1:nfolds)  {  #be careful not to re-use loop indices
+  groupj = (cvgroups == j)
+  traindata = air_final_2[!groupj,]
+  trainx = model.matrix(AQI ~ ., data = traindata)[,-1]
+  trainy = traindata$AQI
+  validdata = air_final_2[groupj,]
+  validx = model.matrix(AQI ~ ., data = validdata)[,-1]
+  validy = validdata$AQI
+  
+  #specify data to be used
+  dataused=traindata
+
+  ###  entire model-fitting process ###
+  ###  on traindata only!!! ###
+  
+  #set up training method
+    training = trainControl(method = "cv", number = 10)
+    
+    
+#CV of Regression with PC1, PC2 from initial PCA
+fit_caret_robust_2 = train(AQI ~ x1 + x2,
+                   data = dataused,
+                method = "rlm",
+                # metric = "RMSE",
+                tuneGrid = NULL,
+                preProc = c("center","scale", "BoxCox"),
+                trControl = ctrl)
+
+ #cross-validation of Regression (by default will tune both Intercept and psi parameters)
+fit_caret_robust = train(AQI ~ .,
+                   data = dataused,
+                method = "rlm",
+                # metric = "RMSE",
+                tuneGrid = NULL,
+                preProc = c("center","scale", "BoxCox"),
+                trControl = ctrl)
+
+ #cross-validation of PCR
+fit_caret_pcr = train(AQI ~ .,
+                data = dataused,
+                method = "pcr",
+                tuneGrid = expand.grid(ncomp = 1:23),
+                preProc = c("center","scale","BoxCox"),
+                trControl = ctrl)
+
+#cross-validation of PLS
+fit_caret_pls = train(AQI ~ .,
+                data = dataused,
+                method = "pls",
+                tuneGrid = expand.grid(ncomp = 1:23),
+                preProc = c("center","scale","BoxCox"),
+                trControl = ctrl)
+
+
+
+  ############# identify selected model to fit to full data #############
+  # all best models
+  all_best_Types = c("rlm", "rlm", "pcr", "pls")
+  all_best_Pars = list(fit_caret_robust_2$bestTune,
+                       fit_caret_robust$bestTune,
+                       fit_caret_pcr$bestTune,   
+                       fit_caret_pls$bestTune)
+  
+  all_best_Models = list(fit_caret_robust_2$finalModel,
+                         fit_caret_robust$finalModel,
+                         fit_caret_pcr$finalModel,
+                         fit_caret_pls$finalModel)
+  
+  all_best_RMSE = c(min(fit_caret_robust_2$results$RMSE),
+                    min(fit_caret_robust$results$RMSE),
+                    min(fit_caret_pcr$results$RMSE),
+                    min(fit_caret_pls$results$RMSE))
+  
+  
+    ############# compare all models - visual understanding #############
+  # model counts and types
+  #rlm = 6 models (2 choices for intercept * 3 choices for weights)
+  #pcr = 23 models (ncomp = 23)
+  #pls = 23 models (ncomp = 23)
+  mmodels = 23+23+6+6
+  modelMethod = c("rlm", "pcr", "pls")
+  
+  all_caret_RMSE = c(fit_caret_robust_2$results$RMSE,
+                     fit_caret_robust$results$RMSE,
+                     fit_caret_pcr$results$RMSE,
+                     fit_caret_pls$results$RMSE)
+  
+  
+  coloptions = rainbow(4)
+  colused = coloptions[as.numeric(factor(modelMethod))+1]
+  charused = 5*(as.numeric(factor(modelMethod)))
+  plot(1:mmodels,all_caret_RMSE,col=colused,pch=charused,
+       xlab = "Model label",ylab = "RMSE",
+       ylim=c(min(all_caret_RMSE)+c(-.1,.5)))
+  order.min = c(which.min(fit_caret_robust_2$results$RMSE),
+                6+which.min(fit_caret_robust$results$RMSE),
+                12+which.min(fit_caret_pcr$results$RMSE),
+                35+which.min(fit_caret_pls$results$RMSE))
+  abline(v=order.min,lwd=2)
+  abline(v=which.min(all_caret_RMSE),col="red",lwd=2)
+  
+  
+  
+  one_best_Type = all_best_Types[which.min(all_best_RMSE)]
+  one_best_Pars = all_best_Pars[which.min(all_best_RMSE)]
+  one_best_Model = all_best_Models[[which.min(all_best_RMSE)]]
+
+  ###  :	:	:	:	:	:	:   ###
+  ###  resulting in     ###
+  ###  one_best_Type and one_best_Pars and one_best_Model ###
+  
+  allbestTypes[j] = one_best_Type
+  allbestPars[[j]] = one_best_Pars
+  
+  if (one_best_Type == "rlm") {  # then best is one of linear models
+    rlm_psi = one_best_Pars[[1]]$psi
+    allpredictedCV[groupj] = predict(fit_caret_robust, validdata, psi = rlm_psi, intercept = TRUE)
+    
+  } else if (one_best_Type == "pcr") {  # then best is PCR model
+    pcr_ncomp = one_best_Pars[[1]]$ncomp
+    allpredictedCV[groupj]  = predict(fit_caret_pcr, validdata, ncomp = pcr_ncomp)
+    
+  } else if (one_best_Type == "pls") {  # best is PLS model
+    pls_ncomp = one_best_Pars[[1]]$ncomp
+      allpredictedCV[groupj]  = predict(fit_caret_pls, validdata, ncomp = pls_ncomp)
+  }
+
+}
+
+# for curiosity / consistency, we can see the models that were "best" on each of the inner splits
+allbestTypes
+allbestPars
+# print individually
+for (j in 1:nfolds) {
+  writemodel = paste("The best model at loop", j, 
+                     "is of type", allbestTypes[j],
+                     "with parameter(s)",allbestPars[j])
+  print(writemodel, quote = FALSE)
+}
+
+#assessment; recall y = AQI
+RMSE = sqrt(mean(allpredictedCV-y)^2); RMSE
+
+R2 = 1-sum((allpredictedCV-y)^2)/sum((y-mean(y))^2); R2
+
+```
+
+FITTING BEST MODEL
+```{r}
+
+#Best model is PCR with 19 components
+#Fit this to full data set
+
+best_model =  train(AQI ~ .,
+                   data = air_final,
+                method = "rlm",
+                # metric = "RMSE",
+                ncomps = 19,
+                preProc = c("center","scale", "BoxCox"),
+                trControl = ctrl)
+
+best_preds = predict(best_model, air_all2)
+
+#assessment
+RMSE = sqrt(mean(best_preds-y)^2)
+RMSE
+#RMSE = 0.154355
+
+R2 = 1-sum((best_preds-y)^2)/sum((y-mean(y))^2)
+R2
+#R2 = 0.3085353
+
+# #Compare with running pcr()
+# pcr_model <- pcr(AQI ~ ., data = air_final, scale = TRUE, validation = "CV")
+# summary(pcr_model)
+
+```
+
+
